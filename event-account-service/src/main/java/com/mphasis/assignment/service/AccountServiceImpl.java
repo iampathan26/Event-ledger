@@ -14,7 +14,11 @@ import com.mphasis.assignment.dto.TransactionResponseDTO;
 import com.mphasis.assignment.entity.Account;
 import com.mphasis.assignment.entity.Transaction;
 import com.mphasis.assignment.entity.TransactionType;
+import com.mphasis.assignment.exception.AccountNotFoundException;
+import com.mphasis.assignment.exception.DuplicateTransactionException;
+import com.mphasis.assignment.exception.InsufficientBalanceException;
 import com.mphasis.assignment.mapper.AccountMapper;
+import com.mphasis.assignment.metrics.MetricsService;
 import com.mphasis.assignment.repository.AccountRepository;
 import com.mphasis.assignment.repository.TransactionRepository;
 
@@ -25,69 +29,93 @@ public class AccountServiceImpl implements AccountService {
 	private static final Logger logger = LoggerFactory.getLogger(AccountServiceImpl.class);
 
 	private final AccountRepository accountRepository;
+
 	private final TransactionRepository transactionRepository;
+
 	private final AccountMapper accountMapper;
 
+	private final MetricsService metricsService;
+
 	public AccountServiceImpl(AccountRepository accountRepository, TransactionRepository transactionRepository,
-			AccountMapper accountMapper) {
+			AccountMapper accountMapper, MetricsService metricsService) {
 
 		this.accountRepository = accountRepository;
 		this.transactionRepository = transactionRepository;
 		this.accountMapper = accountMapper;
+		this.metricsService = metricsService;
 	}
 
 	@Override
 	public AccountResponseDTO processTransaction(Transaction transaction) {
 
-		logger.info("Processing transaction : {}", transaction.getEventId());
+		logger.info("Processing transaction for account : {}", transaction.getAccountId());
 
+		// Check duplicate transaction
 		if (transactionRepository.existsByEventId(transaction.getEventId())) {
 
-			logger.warn("Duplicate transaction ignored : {}", transaction.getEventId());
+			logger.error("Duplicate transaction detected : {}", transaction.getEventId());
 
-			Account account = accountRepository.findById(transaction.getAccountId())
-					.orElseThrow(() -> new RuntimeException("Account not found"));
-
-			return accountMapper.toAccountResponse(account);
+			throw new DuplicateTransactionException(
+					"Transaction already processed with Event Id : " + transaction.getEventId());
 		}
 
-		Account account = accountRepository.findById(transaction.getAccountId())
-				.orElse(new Account(transaction.getAccountId(), BigDecimal.ZERO, transaction.getCurrency()));
+		// Fetch account or create a new one
+		Account account = accountRepository.findById(transaction.getAccountId()).orElseGet(() -> {
 
-		calculateBalance(account, transaction);
+			logger.info("Account not found. Creating new account : {}", transaction.getAccountId());
 
-		accountRepository.save(account);
+			Account newAccount = new Account();
+			newAccount.setAccountId(transaction.getAccountId());
+			newAccount.setBalance(BigDecimal.ZERO);
+			newAccount.setCurrency(transaction.getCurrency());
 
-		transactionRepository.save(transaction);
+			return newAccount;
+		});
 
-		logger.info("Updated balance : {}", account.getBalance());
-
-		return accountMapper.toAccountResponse(account);
-	}
-
-	private void calculateBalance(Account account, Transaction transaction) {
-
-		if (transaction.getType() == TransactionType.CREDIT) {
+		// Process CREDIT transaction
+		if (TransactionType.CREDIT.equals(transaction.getType())) {
 
 			account.setBalance(account.getBalance().add(transaction.getAmount()));
 
-		} else {
+		}
+		// Process DEBIT transaction
+		else {
 
 			if (account.getBalance().compareTo(transaction.getAmount()) < 0) {
 
-				throw new RuntimeException("Insufficient balance for account : " + account.getAccountId());
+				logger.error("Insufficient balance for account : {}", transaction.getAccountId());
+
+				throw new InsufficientBalanceException(
+						"Insufficient balance for account : " + transaction.getAccountId());
 			}
 
 			account.setBalance(account.getBalance().subtract(transaction.getAmount()));
 		}
+
+		logger.info("Saving account details.");
+
+		Account savedAccount = accountRepository.save(account);
+
+		logger.info("Saving transaction details.");
+
+		transactionRepository.save(transaction);
+
+		// Increment Prometheus Metric
+		metricsService.incrementTransactionCount();
+
+		logger.info("Transaction processed successfully.");
+
+		return accountMapper.toAccountResponse(savedAccount);
 	}
 
 	@Override
 	@Transactional(readOnly = true)
 	public AccountResponseDTO getAccount(String accountId) {
 
+		logger.info("Fetching account details for account : {}", accountId);
+
 		Account account = accountRepository.findById(accountId)
-				.orElseThrow(() -> new RuntimeException("Account not found : " + accountId));
+				.orElseThrow(() -> new AccountNotFoundException("Account not found : " + accountId));
 
 		return accountMapper.toAccountResponse(account);
 	}
@@ -96,8 +124,10 @@ public class AccountServiceImpl implements AccountService {
 	@Transactional(readOnly = true)
 	public AccountResponseDTO getBalance(String accountId) {
 
+		logger.info("Fetching balance for account : {}", accountId);
+
 		Account account = accountRepository.findById(accountId)
-				.orElseThrow(() -> new RuntimeException("Account not found : " + accountId));
+				.orElseThrow(() -> new AccountNotFoundException("Account not found : " + accountId));
 
 		return accountMapper.toAccountResponse(account);
 	}
@@ -106,8 +136,11 @@ public class AccountServiceImpl implements AccountService {
 	@Transactional(readOnly = true)
 	public List<TransactionResponseDTO> getTransactions(String accountId) {
 
-		return transactionRepository.findByAccountIdOrderByEventTimestampAsc(accountId).stream()
-				.map(accountMapper::toTransactionResponse).collect(Collectors.toList());
+		logger.info("Fetching transaction history for account : {}", accountId);
+
+		List<Transaction> transactions = transactionRepository.findByAccountIdOrderByEventTimestampAsc(accountId);
+
+		return transactions.stream().map(accountMapper::toTransactionResponse).collect(Collectors.toList());
 	}
 
 }
