@@ -5,13 +5,14 @@ import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.client.RestTemplate;
+
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
 
 import com.mphasis.assignment.dto.EventRequestDTO;
 import com.mphasis.assignment.dto.EventResponseDTO;
@@ -20,10 +21,8 @@ import com.mphasis.assignment.exception.DuplicateEventException;
 import com.mphasis.assignment.exception.EventNotFoundException;
 import com.mphasis.assignment.mapper.EventMapper;
 import com.mphasis.assignment.metrics.MetricsService;
+import com.mphasis.assignment.queue.FallbackQueueService;
 import com.mphasis.assignment.repository.EventRepository;
-
-import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
-import io.github.resilience4j.retry.annotation.Retry;
 
 @Service
 @Transactional
@@ -39,16 +38,19 @@ public class EventServiceImpl implements EventService {
 
 	private final MetricsService metricsService;
 
+	private final FallbackQueueService fallbackQueueService;
+
 	@Value("${account.service.url}")
 	private String accountServiceUrl;
 
 	public EventServiceImpl(EventRepository eventRepository, EventMapper eventMapper, RestTemplate restTemplate,
-			MetricsService metricsService) {
+			MetricsService metricsService, FallbackQueueService fallbackQueueService) {
 
 		this.eventRepository = eventRepository;
 		this.eventMapper = eventMapper;
 		this.restTemplate = restTemplate;
 		this.metricsService = metricsService;
+		this.fallbackQueueService = fallbackQueueService;
 	}
 
 	@Override
@@ -56,67 +58,75 @@ public class EventServiceImpl implements EventService {
 	@Retry(name = "accountService")
 	public EventResponseDTO createEvent(EventRequestDTO request) {
 
-		logger.info("Processing Event : {}", request.getEventId());
+		logger.info("Received event : {}", request.getEventId());
 
 		if (eventRepository.existsByEventId(request.getEventId())) {
 
-			logger.warn("Duplicate Event Received : {}", request.getEventId());
+			logger.error("Duplicate Event Id : {}", request.getEventId());
 
-			throw new DuplicateEventException("Duplicate Event Id : " + request.getEventId());
+			throw new DuplicateEventException("Event already exists with id : " + request.getEventId());
 		}
 
 		Event event = eventMapper.toEntity(request);
 
-		logger.info("Saving Event into Database");
+		logger.info("Saving event into database.");
 
 		Event savedEvent = eventRepository.save(event);
 
-		// Increment Custom Metric
 		metricsService.incrementEventCount();
 
-		String url = accountServiceUrl + "/api/accounts/" + savedEvent.getAccountId() + "/transactions";
-
-		HttpHeaders headers = new HttpHeaders();
-		headers.setContentType(MediaType.APPLICATION_JSON);
-
-		HttpEntity<Event> httpEntity = new HttpEntity<>(savedEvent, headers);
+		logger.info("Calling Account Service.");
 
 		try {
 
-			logger.info("Calling Account Service : {}", url);
+			restTemplate.postForEntity(accountServiceUrl + "/api/accounts/" + event.getAccountId() + "/transactions",
+					savedEvent, Void.class);
 
-			restTemplate.postForEntity(url, httpEntity, Object.class);
-
-			logger.info("Account Service updated successfully.");
+			logger.info("Account Service processed successfully.");
 
 		} catch (Exception ex) {
 
-			logger.error("Account Service call failed : {}", ex.getMessage());
+			logger.error("Account Service unavailable : {}", ex.getMessage());
 
-			throw ex;
+			logger.warn("Adding event into asynchronous fallback queue.");
+
+			fallbackQueueService.add(request);
 		}
+
+		logger.info("Event processed successfully.");
 
 		return eventMapper.toResponse(savedEvent);
 	}
 
 	public EventResponseDTO fallbackProcess(EventRequestDTO request, Exception ex) {
 
-		logger.error("Fallback executed because Account Service is unavailable.");
+		logger.error("Circuit Breaker activated. Reason : {}", ex.getMessage());
 
-		Event event = eventRepository.findById(request.getEventId())
-				.orElseThrow(() -> new EventNotFoundException("Event not found with id : " + request.getEventId()));
+		logger.warn("Adding event {} to fallback queue.", request.getEventId());
 
-		return eventMapper.toResponse(event);
+		fallbackQueueService.add(request);
+
+		EventResponseDTO response = new EventResponseDTO();
+
+		response.setEventId(request.getEventId());
+		response.setAccountId(request.getAccountId());
+		response.setType(request.getType());
+		response.setAmount(request.getAmount());
+		response.setCurrency(request.getCurrency());
+		response.setEventTimestamp(request.getEventTimestamp());
+		response.setMetadata(request.getMetadata());
+
+		return response;
 	}
 
 	@Override
 	@Transactional(readOnly = true)
 	public EventResponseDTO getEventById(String eventId) {
 
-		logger.info("Fetching Event : {}", eventId);
+		logger.info("Fetching event : {}", eventId);
 
 		Event event = eventRepository.findById(eventId)
-				.orElseThrow(() -> new EventNotFoundException("Event not found with id : " + eventId));
+				.orElseThrow(() -> new EventNotFoundException("Event not found : " + eventId));
 
 		return eventMapper.toResponse(event);
 	}
@@ -125,7 +135,7 @@ public class EventServiceImpl implements EventService {
 	@Transactional(readOnly = true)
 	public List<EventResponseDTO> getEventsByAccountId(String accountId) {
 
-		logger.info("Fetching Events for Account : {}", accountId);
+		logger.info("Fetching events for account : {}", accountId);
 
 		List<Event> events = eventRepository.findByAccountIdOrderByEventTimestampAsc(accountId);
 

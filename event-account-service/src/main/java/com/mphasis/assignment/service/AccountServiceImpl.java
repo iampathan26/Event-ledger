@@ -6,6 +6,7 @@ import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -48,18 +49,18 @@ public class AccountServiceImpl implements AccountService {
 	@Override
 	public AccountResponseDTO processTransaction(Transaction transaction) {
 
-		logger.info("Processing transaction for account : {}", transaction.getAccountId());
+		logger.info("Processing transaction with Event Id : {}", transaction.getEventId());
 
 		// Check duplicate transaction
 		if (transactionRepository.existsByEventId(transaction.getEventId())) {
 
-			logger.error("Duplicate transaction detected : {}", transaction.getEventId());
+			logger.error("Duplicate transaction found : {}", transaction.getEventId());
 
 			throw new DuplicateTransactionException(
 					"Transaction already processed with Event Id : " + transaction.getEventId());
 		}
 
-		// Fetch account or create a new one
+		// Fetch existing account or create a new account
 		Account account = accountRepository.findById(transaction.getAccountId()).orElseGet(() -> {
 
 			logger.info("Account not found. Creating new account : {}", transaction.getAccountId());
@@ -75,11 +76,15 @@ public class AccountServiceImpl implements AccountService {
 		// Process CREDIT transaction
 		if (TransactionType.CREDIT.equals(transaction.getType())) {
 
+			logger.info("Processing CREDIT transaction.");
+
 			account.setBalance(account.getBalance().add(transaction.getAmount()));
 
 		}
 		// Process DEBIT transaction
-		else {
+		else if (TransactionType.DEBIT.equals(transaction.getType())) {
+
+			logger.info("Processing DEBIT transaction.");
 
 			if (account.getBalance().compareTo(transaction.getAmount()) < 0) {
 
@@ -100,7 +105,7 @@ public class AccountServiceImpl implements AccountService {
 
 		transactionRepository.save(transaction);
 
-		// Increment Prometheus Metric
+		// Increment Prometheus custom metric
 		metricsService.incrementTransactionCount();
 
 		logger.info("Transaction processed successfully.");
@@ -112,10 +117,10 @@ public class AccountServiceImpl implements AccountService {
 	@Transactional(readOnly = true)
 	public AccountResponseDTO getAccount(String accountId) {
 
-		logger.info("Fetching account details for account : {}", accountId);
+		logger.info("Fetching account details for Account Id : {}", accountId);
 
 		Account account = accountRepository.findById(accountId)
-				.orElseThrow(() -> new AccountNotFoundException("Account not found : " + accountId));
+				.orElseThrow(() -> new AccountNotFoundException("Account not found with Id : " + accountId));
 
 		return accountMapper.toAccountResponse(account);
 	}
@@ -124,10 +129,10 @@ public class AccountServiceImpl implements AccountService {
 	@Transactional(readOnly = true)
 	public AccountResponseDTO getBalance(String accountId) {
 
-		logger.info("Fetching balance for account : {}", accountId);
+		logger.info("Fetching account balance for Account Id : {}", accountId);
 
 		Account account = accountRepository.findById(accountId)
-				.orElseThrow(() -> new AccountNotFoundException("Account not found : " + accountId));
+				.orElseThrow(() -> new AccountNotFoundException("Account not found with Id : " + accountId));
 
 		return accountMapper.toAccountResponse(account);
 	}
@@ -136,7 +141,12 @@ public class AccountServiceImpl implements AccountService {
 	@Transactional(readOnly = true)
 	public List<TransactionResponseDTO> getTransactions(String accountId) {
 
-		logger.info("Fetching transaction history for account : {}", accountId);
+		logger.info("Fetching transaction history for Account Id : {}", accountId);
+
+		if (!accountRepository.existsById(accountId)) {
+
+			throw new AccountNotFoundException("Account not found with Id : " + accountId);
+		}
 
 		List<Transaction> transactions = transactionRepository.findByAccountIdOrderByEventTimestampAsc(accountId);
 
