@@ -1,0 +1,55 @@
+version: "3.8"
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-db
+    restart: always
+
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: eventledger
+
+    ports:
+      - "3306:3306"
+
+    volumes:
+      - mysql-data:/var/lib/mysql
+
+  account-service:
+    build: ./event-account-service
+
+    container_name: account-service
+
+    ports:
+      - "8081:8081"
+
+    depends_on:
+      - mysql
+
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/eventledger
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root123
+
+  event-gateway:
+    build: ./event-gateway
+
+    container_name: event-gateway
+
+    ports:
+      - "8080:8080"
+
+    depends_on:
+      - mysql
+      - account-service
+
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/eventledger
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: root123
+      ACCOUNT_SERVICE_URL: http://account-service:8081
+
+volumes:
+  mysql-data:
